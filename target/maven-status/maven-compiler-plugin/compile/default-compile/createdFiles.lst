@@ -1,0 +1,5 @@
+com\grapecity\phoenix\sqlitetest\NfsTestException.class
+com\grapecity\phoenix\sqlitetest\MainProcess.class
+com\grapecity\phoenix\sqlitetest\UserRepository.class
+com\grapecity\phoenix\sqlitetest\DatabaseConfig.class
+com\grapecity\phoenix\sqlitetest\ChildProcess.class
