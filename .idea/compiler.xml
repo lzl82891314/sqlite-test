@@ -7,7 +7,6 @@
         <sourceTestOutputDir name="target/generated-test-sources/test-annotations" />
         <outputRelativeToContentRoot value="true" />
         <module name="sqlite-test" />
-        <module name="sqlite-test (1)" />
       </profile>
     </annotationProcessing>
   </component>

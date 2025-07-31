@@ -21,7 +21,7 @@ public class MainProcess {
     
     private static final Logger logger = LoggerFactory.getLogger(MainProcess.class);
     private static final int DEFAULT_CHILD_PROCESS_COUNT = 2;
-    private static final int DEFAULT_MAX_CYCLES = 100;
+    private static final int DEFAULT_MAX_CYCLES = 30;
     
     public static void main(String[] args) {
         int childProcessCount = DEFAULT_CHILD_PROCESS_COUNT;
@@ -84,7 +84,7 @@ public class MainProcess {
         System.out.println("  java -jar sqlite-nfs-test.jar [processes] [database] [cycles] [time]");
         System.out.println();
         System.out.println("Parameters:");
-        System.out.println("  processes  - Number of child processes (default: 4)");
+        System.out.println("  processes  - Number of child processes (default: 8)");
         System.out.println("  database   - Database file path (default: nfs-test.db)");
         System.out.println("  cycles     - Max cycles per process (default: 100, -1 for unlimited)");
         System.out.println("  time       - Run time in seconds (only when cycles=0)");
@@ -114,15 +114,24 @@ public class MainProcess {
             // 1. 初始化数据库
             initializeDatabase(databasePath);
             
-            // 2. 启动子进程
-            List<CompletableFuture<Integer>> childProcesses = startChildProcesses(
-                childProcessCount, databasePath, maxCycles, runTimeSeconds);
+            // 2. 创建同步文件用于进程协调
+            String syncFilePath = createSyncFile(databasePath);
             
-            // 3. 监控子进程
+            // 3. 启动子进程
+            List<CompletableFuture<Integer>> childProcesses = startChildProcesses(
+                childProcessCount, databasePath, maxCycles, runTimeSeconds, syncFilePath);
+            
+            // 4. 信号所有进程开始同步工作
+            signalProcessesToStart(syncFilePath, childProcessCount);
+            
+            // 5. 监控子进程
             monitorChildProcesses(childProcesses, databasePath, runTimeSeconds);
             
-            // 4. 输出最终结果
+            // 6. 输出最终结果
             printFinalResults(databasePath);
+            
+            // 7. 清理同步文件
+            cleanupSyncFile(syncFilePath);
             
             logger.info("SQLite NFS multi-process test completed successfully");
             
@@ -171,14 +180,14 @@ public class MainProcess {
      * 启动多个子进程
      */
     private List<CompletableFuture<Integer>> startChildProcesses(
-            int childProcessCount, String databasePath, int maxCycles, int runTimeSeconds) {
+            int childProcessCount, String databasePath, int maxCycles, int runTimeSeconds, String syncFilePath) {
         
         logger.info("Starting {} child processes", childProcessCount);
         List<CompletableFuture<Integer>> futures = new ArrayList<>();
         
         for (int i = 1; i <= childProcessCount; i++) {
             String processName = "ChildProcess-" + i;
-            CompletableFuture<Integer> future = startChildProcess(processName, databasePath, maxCycles, runTimeSeconds);
+            CompletableFuture<Integer> future = startChildProcess(processName, databasePath, maxCycles, runTimeSeconds, syncFilePath);
             futures.add(future);
             logger.info("Started child process: {}", processName);
         }
@@ -189,7 +198,7 @@ public class MainProcess {
     /**
      * 启动单个子进程
      */
-    private CompletableFuture<Integer> startChildProcess(String processName, String databasePath, int maxCycles, int runTimeSeconds) {
+    private CompletableFuture<Integer> startChildProcess(String processName, String databasePath, int maxCycles, int runTimeSeconds, String syncFilePath) {
         return CompletableFuture.supplyAsync(() -> {
             try {
                 // 构建Java命令
@@ -205,9 +214,8 @@ public class MainProcess {
                 command.add(processName);
                 command.add(databasePath);
                 command.add(String.valueOf(maxCycles));
-                if (runTimeSeconds > 0) {
-                    command.add(String.valueOf(runTimeSeconds));
-                }
+                command.add(String.valueOf(runTimeSeconds)); // 总是添加runTimeSeconds参数
+                command.add(syncFilePath); // 添加同步文件路径
                 
                 // 启动进程
                 ProcessBuilder processBuilder = new ProcessBuilder(command);
@@ -323,11 +331,10 @@ public class MainProcess {
             logger.info("Final user count: {}", finalUserCount);
             logger.info("Database file size: {} bytes", new File(databasePath).length());
             
-            // 检查数据库完整性
-            if (userRepository.isConnectionHealthy()) {
-                logger.info("Database integrity check: PASSED");
-            } else {
-                logger.warn("Database integrity check: FAILED");
+            // 执行综合数据库健康检查
+            boolean isHealthy = userRepository.performComprehensiveHealthCheck();
+            if (!isHealthy) {
+                logger.error("Final database health check revealed issues - possible NFS-related corruption detected!");
             }
             
             logger.info("=== Test Completed ===");
@@ -384,5 +391,68 @@ public class MainProcess {
                 logger.error("Statistics thread failed", e);
             }
         });
+    }
+    
+    /**
+     * 创建同步文件用于进程协调
+     */
+    private String createSyncFile(String databasePath) {
+        try {
+            File dbFile = new File(databasePath);
+            String syncFilePath = dbFile.getParent() != null ? 
+                dbFile.getParent() + "/sync.tmp" : "sync.tmp";
+            
+            File syncFile = new File(syncFilePath);
+            if (syncFile.exists()) {
+                syncFile.delete();
+            }
+            
+            // 创建空的同步文件
+            syncFile.createNewFile();
+            logger.info("Created synchronization file: {}", syncFilePath);
+            return syncFilePath;
+            
+        } catch (IOException e) {
+            logger.error("Failed to create sync file", e);
+            throw new NfsTestException("Failed to create synchronization file", e);
+        }
+    }
+    
+    /**
+     * 信号所有进程开始同步工作
+     */
+    private void signalProcessesToStart(String syncFilePath, int expectedProcessCount) {
+        try {
+            // 等待一小段时间确保所有子进程都已启动并等待
+            logger.info("Waiting for all {} child processes to initialize...", expectedProcessCount);
+            Thread.sleep(3000);
+            
+            // 写入启动信号到同步文件
+            File syncFile = new File(syncFilePath);
+            try (java.io.FileWriter writer = new java.io.FileWriter(syncFile)) {
+                writer.write("START:" + System.currentTimeMillis() + ":" + expectedProcessCount);
+            }
+            
+            logger.info("Sent START signal to all child processes");
+            
+        } catch (Exception e) {
+            logger.error("Failed to signal processes to start", e);
+            throw new NfsTestException("Failed to send start signal", e);
+        }
+    }
+    
+    /**
+     * 清理同步文件
+     */
+    private void cleanupSyncFile(String syncFilePath) {
+        try {
+            File syncFile = new File(syncFilePath);
+            if (syncFile.exists()) {
+                syncFile.delete();
+                logger.info("Cleaned up synchronization file");
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to cleanup sync file", e);
+        }
     }
 }
